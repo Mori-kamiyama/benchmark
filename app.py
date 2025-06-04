@@ -91,8 +91,12 @@ def calculate_metrics(df):
     if df.empty:
         return df
 
-    # 最適解推定式 3n²/8 との差分
-    df['estimated_optimal'] = (3 * df['size'] * df['size']) / 8
+    # 最適解推定式 (ユーザー提供のカスタム式) との差分
+    # y = 1/8 * n^3 - n^2 + 7*n - 14
+    # 結果が1未満の場合は1とする
+    s = df['size'] # For brevity
+    calculated_value = (1/8 * s**3) - (s**2) + (7*s) - 14
+    df['estimated_optimal'] = np.maximum(1, calculated_value) # np.maximum は Series にも対応
     df['diff_from_estimated'] = df['num_moves'] - df['estimated_optimal']
 
     # n²との差分
@@ -103,17 +107,29 @@ def calculate_metrics(df):
     df['search_efficiency'] = df['nodes_explored'] / (df['calculation_time_ms'] / 1000)
 
     # 総合スコア（参考値）- 小さいほど良い
+    # 各指標を0-1の範囲に正規化し、合計する。
+    # calculation_time_ms と num_moves は小さいほど良いため、そのまま正規化。
+    # search_efficiency は大きいほど良いため、 (1 - 正規化値) を使用してスコアに寄与させる。
+    # 1e-10 はゼロ除算を避けるための微小値。
     if len(df) > 1:  # 正規化のために複数のデータが必要
-        time_normalized = (df['calculation_time_ms'] - df['calculation_time_ms'].min()) / (
-                df['calculation_time_ms'].max() - df['calculation_time_ms'].min() + 1e-10)
-        moves_normalized = (df['num_moves'] - df['num_moves'].min()) / (
-                df['num_moves'].max() - df['num_moves'].min() + 1e-10)
-        efficiency_normalized = 1 - ((df['search_efficiency'] - df['search_efficiency'].min()) / (
-            df['search_efficiency'].max() - df['search_efficiency'].min() + 1e-10))
+        time_normalized = (df['calculation_time_ms'] - df['calculation_time_ms'].min()) / \
+                          (df['calculation_time_ms'].max() - df['calculation_time_ms'].min() + 1e-10)
+        moves_normalized = (df['num_moves'] - df['num_moves'].min()) / \
+                           (df['num_moves'].max() - df['num_moves'].min() + 1e-10)
+        # search_efficiency は高いほど良いため、スコアとしては (1 - 正規化値) を使うことで、低い方が良い指標に合わせる
+        efficiency_normalized = 1 - ((df['search_efficiency'] - df['search_efficiency'].min()) / \
+                                     (df['search_efficiency'].max() - df['search_efficiency'].min() + 1e-10))
 
         df['composite_score'] = time_normalized + moves_normalized + efficiency_normalized
     else:
+        # データポイントが1つしかない場合は正規化できないため、デフォルトスコアを設定
         df['composite_score'] = 1.0
+
+    # Add Manhattan distance diffs if columns are available
+    if 'manhattan_min' in df.columns and 'num_moves' in df.columns:
+        df['diff_from_manhattan_min'] = df['num_moves'] - df['manhattan_min']
+    if 'manhattan_max' in df.columns and 'num_moves' in df.columns:
+        df['diff_from_manhattan_max'] = df['num_moves'] - df['manhattan_max']
 
     return df
 
@@ -146,23 +162,80 @@ def calculate_summary(df):
 @st.cache_data
 def load_benchmark_results():
     """ベンチマーク結果を読み込む"""
-    results_file = "benchmark_results.csv"
-    summary_file = "benchmark_summary.json"
+    results_file = Path("benchmark_results.csv")
+    summary_file = Path("benchmark_summary.json")
+    problems_summary_file = Path("problems_summary.csv")
+    problems_summary_df = None
 
-    if not os.path.exists(results_file):
+    try:
+        if problems_summary_file.exists():
+            problems_summary_df = pd.read_csv(problems_summary_file)
+            if problems_summary_df.empty:
+                st.warning(f"問題概要ファイル '{problems_summary_file}' は空です。マンハッタン距離比較は利用できません。")
+                problems_summary_df = None
+        else:
+            st.info(f"問題概要ファイル '{problems_summary_file}' が見つかりません。マンハッタン距離比較は利用できません。")
+    except pd.errors.EmptyDataError: # Should be caught by problems_summary_df.empty check, but as a safeguard
+        st.warning(f"問題概要ファイル '{problems_summary_file}' は空です。マンハッタン距離比較は利用できません。")
+        problems_summary_df = None
+    except pd.errors.ParserError:
+        st.error(f"問題概要ファイル '{problems_summary_file}' の解析に失敗しました。マンハッタン距離比較は利用できません。")
+        problems_summary_df = None
+    except FileNotFoundError: # Should be caught by .exists(), but as a safeguard
+        st.info(f"問題概要ファイル '{problems_summary_file}' が見つかりません。マンハッタン距離比較は利用できません。")
+        problems_summary_df = None
+
+
+    if not results_file.exists():
         return pd.DataFrame(), None
 
-    df = pd.read_csv(results_file)
+    try:
+        df = pd.read_csv(results_file)
+    except pd.errors.EmptyDataError:
+        st.warning(f"ベンチマーク結果ファイル '{results_file}' は空です。")
+        return pd.DataFrame(), None
+    except pd.errors.ParserError:
+        st.error(f"ベンチマーク結果ファイル '{results_file}' の解析に失敗しました。ファイルが破損している可能性があります。")
+        return pd.DataFrame(), None
+
+    if problems_summary_df is not None and not problems_summary_df.empty and 'problem_id' in df.columns:
+        try:
+            # Ensure 'problem_id' in df is string before stripping, and handle potential errors if it's not
+            if pd.api.types.is_string_dtype(df['problem_id']):
+                df['problem_id_numeric'] = df['problem_id'].str.lstrip('p').astype(int)
+            elif pd.api.types.is_numeric_dtype(df['problem_id']): # If it's already numeric (e.g. from old file)
+                df['problem_id_numeric'] = df['problem_id'].astype(int)
+            else: # Try converting to string first
+                df['problem_id_numeric'] = df['problem_id'].astype(str).str.lstrip('p').astype(int)
+
+            df = pd.merge(
+                df,
+                problems_summary_df,
+                left_on=['size', 'problem_id_numeric'],
+                right_on=['size', 'problem_id'], # Assuming 'problem_id' in problems_summary.csv is already numeric
+                how='left',
+                suffixes=('', '_summary')
+            )
+            if 'problem_id_summary' in df.columns:
+                df = df.drop(columns=['problem_id_summary'])
+            # We might want to keep problem_id_numeric for other uses or drop it:
+            # if 'problem_id_numeric' in df.columns:
+            #     df = df.drop(columns=['problem_id_numeric'])
+        except ValueError as e:
+            st.error(f"ベンチマーク結果の 'problem_id' の形式が不正なため、問題概要データとのマージに失敗しました: {e}")
+        except Exception as e: # Catch any other unexpected error during merge
+            st.error(f"問題概要データとのマージ中に予期せぬエラーが発生しました: {e}")
+
 
     summary = None
-    if os.path.exists(summary_file):
+    if summary_file.exists():
         try:
-            with open(summary_file, 'r', encoding='utf-8') as f:
-                # First, check if the file is not empty to avoid an error
-                if os.path.getsize(summary_file) > 0:
+            # First, check if the file is not empty to avoid an error
+            if summary_file.stat().st_size > 0:
+                with summary_file.open('r', encoding='utf-8') as f:
                     summary = json.load(f)
-                else:
-                    st.warning(f"警告: '{summary_file}' は空です。無視されます。")
+            else:
+                st.warning(f"警告: '{summary_file}' は空です。無視されます。")
         except json.JSONDecodeError as e:
             st.warning(f"'{summary_file}' の読み込みに失敗しました。ファイルが破損している可能性があります。")
             st.error(f"エラー詳細: {e}")
@@ -176,42 +249,46 @@ def load_benchmark_results():
 def kill_process_tree(process):
     """プロセスツリー全体を確実に終了する"""
     try:
-        # psutilを使用してプロセスツリーを取得
+        # psutilを使用して指定されたプロセスの情報を取得
         parent = psutil.Process(process.pid)
+        # そのプロセスの子プロセスを再帰的に全て取得
         children = parent.children(recursive=True)
 
-        # 子プロセスから順に終了
+        # まず子プロセスから順に終了させる
         for child in children:
             try:
-                child.terminate()
+                child.terminate()  # SIGTERMを送信
             except psutil.NoSuchProcess:
-                pass
+                pass  # プロセスが既に存在しない場合は何もしない
 
-        # 親プロセスを終了
+        # 次に親プロセスを終了させる
         try:
-            parent.terminate()
+            parent.terminate()  # SIGTERMを送信
         except psutil.NoSuchProcess:
-            pass
+            pass  # プロセスが既に存在しない場合は何もしない
 
-        # 少し待ってから強制終了
+        # terminateシグナルで終了しなかったプロセスがいないか確認し、強制終了する
+        # wait_procsでプロセスの終了を待つ（タイムアウト付き）
         gone, still_alive = psutil.wait_procs(children + [parent], timeout=3)
-        for p in still_alive:
+        for p in still_alive: # タイムアウト後も生存しているプロセスに対して
             try:
-                p.kill()
+                p.kill()  # SIGKILLを送信して強制終了
             except psutil.NoSuchProcess:
-                pass
+                pass  # プロセスが既に存在しない場合は何もしない
 
-    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-        # プロセスが既に終了している場合やアクセス権限がない場合
-        # 通常のプロセス終了を試行
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError) as e:
+        # 指定されたプロセスが存在しない、アクセス権がない、その他のOSエラーの場合
+        # subprocessの標準的な方法でプロセス終了を試みる
+        st.warning(f"psutilでのプロセスツリー終了中にエラー: {e}。標準的な終了処理を試みます。")
         try:
-            process.terminate()
-            process.wait(timeout=3)
+            process.terminate()  # SIGTERMを送信
+            process.wait(timeout=3)  # 終了を待つ（タイムアウト付き）
         except subprocess.TimeoutExpired:
-            process.kill()
+            process.kill()  # タイムアウトならSIGKILLを送信
             process.wait()
-        except OSError:
-            pass
+        except OSError as final_e: # killでもエラーが出る場合
+            st.error(f"標準的なプロセス終了処理でもエラー: {final_e}。")
+            pass # これ以上できることは少ない
 
 
 def run_single_problem(executable_path, problem_path):
@@ -283,26 +360,32 @@ def run_single_problem(executable_path, problem_path):
         return None, f"予期せぬ実行エラー: {str(e)}"
 
 
-def run_benchmark_with_config(executable_path, problems_dir, problems_per_size, min_size, max_size):
+def run_benchmark_with_config(executable_path_str, problems_dir_str, problems_per_size, min_size, max_size):
     """設定を使用してベンチマークを実行（サイズ範囲指定付き）"""
-    if not os.path.exists(executable_path):
+    executable_path = Path(executable_path_str)
+    problems_dir = Path(problems_dir_str)
+
+    if not executable_path.exists():
         st.error(f"実行ファイル '{executable_path}' が見つかりません")
         return
 
-    if not os.path.exists(problems_dir):
+    if not problems_dir.is_dir(): # Changed from exists() to is_dir() for clarity
         st.error(f"問題ディレクトリ '{problems_dir}' が見つかりません")
         return
 
     # 問題ファイルを取得するロジック
     problem_files = []
-    # problemsディレクトリ内のフォルダ('4x4', '5x5'など)をソートして取得
-    size_dirs = sorted([d for d in Path(problems_dir).iterdir() if d.is_dir()], key=lambda d: int(d.name.split('x')[0]))
+    # problemsディレクトリ内のフォルダ('4x4', '5x5'など)を名前からサイズを読み取りソートして取得
+    size_dirs = sorted(
+        [d for d in problems_dir.iterdir() if d.is_dir() and 'x' in d.name],  # 'x' を含むディレクトリのみを対象
+        key=lambda d: int(d.name.split('x')[0])
+    )
 
     for size_dir in size_dirs:
         try:
-            # ## 追加: ディレクトリ名からサイズをパース ##
+            # ディレクトリ名 (例: "4x4") からサイズ (例: 4) を取得
             current_size = int(size_dir.name.split('x')[0])
-            # ## 追加: 指定されたサイズ範囲外であればスキップ ##
+            # 指定されたサイズ範囲外であれば、このディレクトリ内の問題はスキップ
             if not (min_size <= current_size <= max_size):
                 continue
         except (ValueError, IndexError):
@@ -321,50 +404,80 @@ def run_benchmark_with_config(executable_path, problems_dir, problems_per_size, 
     st.info(f"実行する問題数: {len(problem_files)}")
 
     progress_bar = st.progress(0, text="ベンチマーク実行準備中...")
-    results = []
+    results = []  # 成功した問題の結果を格納するリスト
+    failed_problems_details = [] # 失敗した問題の詳細を格納するリスト
     start_time = time.time()
 
     for i, problem_path in enumerate(problem_files):
         progress = (i + 1) / len(problem_files)
+        # UIに進捗を表示 (例: "実行中 (10/100): p010.json")
         progress_bar.progress(progress, text=f"実行中 ({i + 1}/{len(problem_files)}): {problem_path.name}")
 
-        result, error = run_single_problem(executable_path, str(problem_path))
+        # 個別の問題を実行し、結果とエラー(あれば)を取得
+        result, error = run_single_problem(str(executable_path), str(problem_path))
 
-        if result:
+        if result: # 実行成功時
             try:
+                # 問題ファイルパスからサイズと問題IDを抽出
+                # 例: problems/4x4/p001.json -> path_parts = ('problems', '4x4', 'p001.json')
                 path_parts = problem_path.parts
-                size_str = path_parts[-2]
-                problem_id_str = problem_path.stem
-                size = int(size_str.split('x')[0])
+                size_str = path_parts[-2]  # '4x4'
+                problem_id_str = problem_path.stem  # 'p001'
+                size = int(size_str.split('x')[0]) # 4
 
+                # 結果にIDとサイズ情報を追加してリストに格納
                 result['problem_id'] = problem_id_str
                 result['size'] = size
                 results.append(result)
             except (IndexError, ValueError) as e:
+                # パス解析に失敗した場合 (通常は起こり得ないが念のため)
                 st.warning(f"パス '{problem_path}' からサイズまたはIDの解析に失敗: {e}")
-        else:
+        else: # 実行失敗時
+            # UIに警告を表示し、失敗リストに詳細を記録
             st.warning(f"問題 {problem_path.name} でエラー: {error}")
+            failed_problems_details.append({'name': problem_path.name, 'path': str(problem_path), 'error': error})
 
-    end_time = time.time()
+    end_time = time.time() # ベンチマーク全体の終了時刻
 
     if results:
         df = pd.DataFrame(results)
         df = calculate_metrics(df)
-        df.to_csv("benchmark_results.csv", index=False)
+        results_csv_path = Path("benchmark_results.csv")
+        summary_json_path = Path("benchmark_summary.json")
+        df.to_csv(results_csv_path, index=False)
 
         summary = calculate_summary(df)
         if summary:
-            with open("benchmark_summary.json", 'w', encoding='utf-8') as f:
+            with summary_json_path.open('w', encoding='utf-8') as f:
                 json.dump(summary, f, indent=2, ensure_ascii=False, default=to_serializable)
 
         progress_bar.progress(1.0, text="完了！")
         st.success(f"ベンチマーク実行完了！ (合計時間: {end_time - start_time:.2f}秒)")
         st.success(f"成功: {len(results)}/{len(problem_files)} 問題")
 
+        if failed_problems_details:
+            st.error(f"実行中に {len(failed_problems_details)} 件のエラーが発生しました。")
+            with st.expander("⚠️ ベンチマーク実行エラーの詳細を表示", expanded=True):
+                for failure in failed_problems_details:
+                    st.markdown(f"**問題ファイル:** `{failure['name']}`")
+                    st.markdown(f"**パス:** `{failure['path']}`")
+                    st.markdown(f"**エラー内容:**")
+                    st.error(f"{failure['error']}") # Using st.error for the message itself
+                    st.markdown("---") # Separator
+
         load_benchmark_results.clear()
         st.rerun()
     else:
         st.error("実行に成功した問題がありませんでした")
+        if failed_problems_details: # Also show errors if no problems succeeded
+            st.error(f"実行中に {len(failed_problems_details)} 件のエラーが発生しました。")
+            with st.expander("⚠️ ベンチマーク実行エラーの詳細を表示", expanded=True):
+                for failure in failed_problems_details:
+                    st.markdown(f"**問題ファイル:** `{failure['name']}`")
+                    st.markdown(f"**パス:** `{failure['path']}`")
+                    st.markdown(f"**エラー内容:**")
+                    st.error(f"{failure['error']}")
+                    st.markdown("---")
 
 
 def display_metrics_overview(summary):
@@ -458,6 +571,11 @@ def plot_search_performance(df):
 def plot_solution_quality(df):
     """解の品質分析"""
     st.subheader("🎯 解の品質分析")
+    st.caption("""
+    ここでは、実際の解決手数が理論的な推定値や限界値とどの程度異なるかを分析します。
+    - 「推定最適解」は、ユーザー提供の計算式 (y = 1/8 n³ - n² + 7n - 14, 結果は最小1) に基づく理論的な最適手数です。グラフではこの推定値からの差分（実際の手数 - 推定最適解）を示します。
+    - 「理論最大値(n²)」は、手数の単純な上限の目安です。グラフではこのn²からの差分（実際の手数 - n²）を示します。
+    """)
     if 'diff_from_estimated' not in df.columns:
         st.info("解の品質を分析するためのデータが不足しています。")
         return
@@ -466,7 +584,7 @@ def plot_solution_quality(df):
     with col1:
         fig = px.scatter(df, x='size', y='diff_from_estimated',
                          color='num_moves',
-                         title='推定最適解(3n²/8)からの差分',
+                         title='推定最適解 (カスタム式) からの差分',
                          labels={'diff_from_estimated': '差分 (moves)',
                                  'size': 'パズルサイズ',
                                  'num_moves': '実際の手数'},
@@ -489,6 +607,11 @@ def plot_manhattan_comparison(df):
     """マンハッタン距離との比較"""
     if all(col in df.columns for col in ['diff_from_manhattan_min', 'diff_from_manhattan_max']):
         st.subheader("📏 マンハッタン距離ベース比較")
+        st.caption("""
+        マンハッタン距離は、各牌の現在位置から目的位置までの縦横の移動距離の総和に関連するヒューリスティックです。
+        ここでは、A*探索で得られた実際の解決手数が、問題の初期状態のマンハッタン距離から計算される理論的な手数範囲（最小・最大推定値）とどの程度異なるかを示します。
+        これにより、ヒューリスティック関数（この場合はマンハッタン距離に関連する何か）の品質や、解がこれらの推定範囲内に収まるかを評価するのに役立ちます。
+        """)
         col1, col2 = st.columns(2)
         with col1:
             fig = px.box(df, x='size', y='diff_from_manhattan_min',
@@ -522,13 +645,13 @@ def plot_comprehensive_analysis(df):
         'composite_score': 'mean'
         }).reset_index()
 
-    # 正規化対象のメトリクス
+    # 正規化対象のメトリクスとその評価タイプ ('lower_is_better' または 'higher_is_better')
     metrics_to_scale = {
-            'calculation_time_ms': 'lower_is_better',
-            'nodes_explored': 'lower_is_better',
-            'num_moves': 'lower_is_better',
-            'composite_score': 'lower_is_better',
-            'search_efficiency': 'higher_is_better'
+            'calculation_time_ms': 'lower_is_better',  # 計算時間は短いほど良い
+            'nodes_explored': 'lower_is_better',       # 探索ノード数は少ないほど良い
+            'num_moves': 'lower_is_better',            # 手数は少ないほど良い
+            'composite_score': 'lower_is_better',      # 総合スコアは小さいほど良い
+            'search_efficiency': 'higher_is_better'    # 探索効率は高いほど良い
             }
 
     scaled_summary = size_summary.copy()
@@ -538,17 +661,19 @@ def plot_comprehensive_analysis(df):
             min_val = scaled_summary[metric].min()
             max_val = scaled_summary[metric].max()
 
-            # ゼロ除算を避ける
+            # ゼロ除算を避けるためのチェック (minとmaxが同じ場合、全ての値が同じなのでスコアは100とする)
             if (max_val - min_val) == 0:
-                scaled_summary[metric] = 100.0
+                scaled_summary[metric] = 100.0  # 全て同じ値なら満点（または中間点、ここでは100）
                 continue
 
-            # Min-Max スケーリング
+            # Min-Max スケーリング を0-100の範囲で行う
             if scale_type == 'lower_is_better':
-                # 値が小さいほど100に近づく
+                # 値が小さいほどスコアが100に近づくように正規化
+                # (例: min=10, max=110 の時、値が10ならスコア100、値が110ならスコア0)
                 scaled_summary[metric] = 100 * (1 - (scaled_summary[metric] - min_val) / (max_val - min_val))
-            else: # higher_is_better
-                # 値が大きいほど100に近づく
+            else: # 'higher_is_better'
+                # 値が大きいほどスコアが100に近づくように正規化
+                # (例: min=10, max=110 の時、値が10ならスコア0、値が110ならスコア100)
                 scaled_summary[metric] = 100 * ((scaled_summary[metric] - min_val) / (max_val - min_val))
 
     # 表示するメトリクスの順番と名前を定義
@@ -578,6 +703,20 @@ def plot_comprehensive_analysis(df):
 def display_detailed_table(df):
     """詳細データテーブル"""
     st.subheader("📋 詳細データ")
+    st.caption("""
+    **表の主な指標の説明:**
+    - **size:** パズルのサイズ (例: 4x4の場合, 4)。
+    - **problem_id:** 問題の識別子。
+    - **solved:** 問題が解決されたかどうか (True/False)。
+    - **num_moves:** 解決までの実際の手数。
+    - **calculation_time_ms:** アルゴリズムによる計算時間 (ミリ秒)。
+    - **nodes_explored:** 探索中に展開されたノードの総数。
+    - **search_efficiency:** 探索効率 (ノード/秒)。
+    - **diff_from_estimated:** 「推定最適解 (カスタム式: 1/8 n³ - n² + 7n - 14, 最小1)」からの実際の手数の差。
+    - **composite_score:** 計算時間, 手数, 探索効率を正規化して組み合わせた総合スコア（このスコアが小さいほど良いと評価されます）。
+    - **error:** 問題解決に失敗した場合のエラーメッセージ。
+    (上記に加えて, `problems_summary.csv` とのマージに成功した場合, `manhattan_min`, `manhattan_max` などの列も表示されることがあります。)
+    """)
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -628,16 +767,18 @@ def main():
     st.title("🔍 高専プロコン競技 ベンチマーク結果ダッシュボード")
 
     st.sidebar.title("⚙️ 操作パネル")
-    executable_path = st.sidebar.text_input("実行ファイルパス", value="./astar_manhattan")
-    problems_dir = st.sidebar.text_input("問題ディレクトリ", value="problems")
+    executable_path_str = st.sidebar.text_input("実行ファイルパス", value="./astar_manhattan")
+    problems_dir_str = st.sidebar.text_input("問題ディレクトリ", value="problems")
+    executable_path = Path(executable_path_str)
+    problems_dir = Path(problems_dir_str)
 
     # ## 追加: 問題ディレクトリから利用可能なサイズの範囲を自動検出 ##
     min_avail = 4
     max_avail = 24 # デフォルト値
-    problem_path_obj = Path(problems_dir)
-    if problem_path_obj.exists() and problem_path_obj.is_dir():
+    # problem_path_obj = Path(problems_dir) # Already a Path object
+    if problems_dir.exists() and problems_dir.is_dir():
         available_sizes = []
-        for d in problem_path_obj.iterdir():
+        for d in problems_dir.iterdir():
             if d.is_dir():
                 try:
                     size = int(d.name.split('x')[0])
@@ -672,7 +813,7 @@ def main():
     # ## 変更: ベンチマーク実行ボタンのロジック ##
     if st.sidebar.button("🚀 ベンチマーク実行", type="primary", disabled=(min_size > max_size)):
         # ## 変更: min_sizeとmax_sizeを引数に追加 ##
-        run_benchmark_with_config(executable_path, problems_dir, problems_per_size, min_size, max_size)
+        run_benchmark_with_config(str(executable_path), str(problems_dir), problems_per_size, min_size, max_size)
 
     df, summary = load_benchmark_results()
 
