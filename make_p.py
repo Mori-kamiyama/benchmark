@@ -48,28 +48,27 @@ def generate_unique_problem(size, existing_hashes):
             }
     raise RuntimeError(f"❌ {size}x{size} で一意な問題が生成できませんでした（{MAX_TRIES}回試行）")
 
-def save_problems(base_dir="./problems", sizes=range(4, 25), per_size=20, start_id=1):
-    problem_counter = start_id
+def save_problems(base_dir="./problems", sizes=range(4, 25, 2), per_size=100):
     existing_hashes = set()
 
     for size in sizes:
         folder_name = os.path.join(base_dir, f"{size}x{size}")
         os.makedirs(folder_name, exist_ok=True)
 
-        for _ in range(per_size):
-            file_name = f"p{str(problem_counter).zfill(3)}.json"
+        for idx in range(per_size):
+            problem = generate_unique_problem(size, existing_hashes)
+
+            file_name = f"p{idx:03}.json"   # p000 – p099 など
             file_path = os.path.join(folder_name, file_name)
 
-            problem = generate_unique_problem(size, existing_hashes)
-            with open(file_path, "w") as f:
+            with open(file_path, "w", encoding="utf-8") as f:
                 json.dump(problem, f, indent=2)
 
             print(f"✅ Generated: {file_path}")
-            problem_counter += 1
 
 if __name__ == "__main__":
     save_problems(
         base_dir="problems",
-        sizes=range(4, 25),  # 4x4～24x24
-        per_size=25          # 各サイズ20個
+        sizes=range(4, 25, 2),  # 4x4～24x24
+        per_size=100           # 各サイズ100個
     )

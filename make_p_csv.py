@@ -9,7 +9,7 @@ import csv
 # 5 ≤ Mopt​(4) ≤ 7 ⟹ 5/16​n^2 ≤ Mopt​(n) ≤ 7/16​n^2 (4 のとき n^2 =16)となり
 # 推定値は3/8n^2程度が推定値である
 def optimal_moves(n):
-    return math.floor(3 / 8 * n ** 2)
+    return math.floor((2 / 25 * n ** 3) + 3 / 2)
 
 # 各ペアのマンハッタン距離を計算し、その総和を返す
 def manhattan_dis(data):
@@ -20,8 +20,6 @@ def manhattan_dis(data):
     for i in range(size):
         for j in range(size):
             val = table[i][j]
-            if val == 0:
-                continue
             if val not in positions:
                 positions[val] = []
             positions[val].append((i, j))
@@ -65,19 +63,27 @@ for folder in folders:
         if not fname.endswith(".json"):
             continue
         fpath = os.path.join(folder_path, fname)
-        with open(fpath, "r") as f:
-            data = json.load(f)
-            size = data["problem"]["field"]["size"]
-            problem_id = int(fname.replace(".json", "").lstrip("p"))
-            D = manhattan_dis(data)
-            rows.append({
-                "problem_id": problem_id,
-                "size": size,
-                "optimal_moves": optimal_moves(size),
-                "n_squared": size * size,
-                "manhattan_min": man_min(D, size),
-                "manhattan_max": man_max(D)
-            })
+        try:
+            # スカスカ JSON を除外
+            if os.path.getsize(fpath) == 0:
+                raise ValueError("empty file")
+            # 正常なら読み込む
+            with open(fpath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (ValueError, json.JSONDecodeError) as e:
+            print(f"⚠️  Skipping {fname}: {e}")
+            continue
+        size = data["problem"]["field"]["size"]
+        problem_id = int(fname.replace(".json", "").lstrip("p"))
+        D = manhattan_dis(data)
+        rows.append({
+            "problem_id": problem_id,
+            "size": size,
+            "optimal_moves": optimal_moves(size),
+            "n_squared": size * size,
+            "manhattan_min": man_min(D, size),
+            "manhattan_max": man_max(D)
+        })
 
 with open(OUTPUT_FILE, "w", newline="") as f:
     writer = csv.DictWriter(f, fieldnames=rows[0].keys())
