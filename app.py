@@ -186,8 +186,55 @@ def kill_process_tree(process):
             pass
 
 
+def get_timeout_config_path(executable_path: str) -> str:
+    """実行ファイルパスから設定ファイルパスを生成する"""
+    exec_path = Path(executable_path)
+    config_filename = f"{exec_path.stem}_config.json"
+    return str(exec_path.parent / config_filename)
+
+
+def load_timeout_from_config(config_path: str) -> int:
+    """設定ファイルからタイムアウト値を読み込む"""
+    default_timeout = 60
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config_data = json.load(f)
+        timeout = config_data.get("timeout")
+        if isinstance(timeout, int) and 10 <= timeout <= 300:
+            return timeout
+        else:
+            # Log or warn about invalid timeout value, then return default
+            st.warning(f"設定ファイル '{config_path}' のタイムアウト値が無効です (値: {timeout})。デフォルト値 {default_timeout}秒 を使用します。")
+            return default_timeout
+    except FileNotFoundError:
+        # Log or inform that config file was not found, using default
+        # st.info(f"設定ファイル '{config_path}' が見つかりません。デフォルトタイムアウト {default_timeout}秒 を使用します。")
+        return default_timeout
+    except (json.JSONDecodeError, KeyError, ValueError) as e:
+        # Log or warn about error in config file
+        st.warning(f"設定ファイル '{config_path}' の読み込み中にエラーが発生しました: {e}。デフォルト値 {default_timeout}秒 を使用します。")
+        return default_timeout
+
+
+def save_timeout_to_config(config_path: str, timeout_value: int):
+    """設定ファイルにタイムアウト値を保存する"""
+    try:
+        # Ensure the directory exists
+        Path(config_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump({"timeout": timeout_value}, f, indent=2)
+        st.toast(f"タイムアウト設定 ({timeout_value}秒) を '{config_path}' に保存しました。", icon="✅")
+    except IOError as e:
+        st.error(f"設定ファイル '{config_path}' の保存中にエラーが発生しました: {e}")
+    except Exception as e:
+        st.error(f"タイムアウト設定の保存中に予期せぬエラーが発生しました: {e}")
+
+
 def run_single_problem(executable_path, problem_path):
     """単一の問題を実行し、結果を返す"""
+    config_path = get_timeout_config_path(executable_path)
+    configured_timeout = load_timeout_from_config(config_path)
+
     cat_process = None
     astar_process = None
     try:
@@ -196,7 +243,7 @@ def run_single_problem(executable_path, problem_path):
         astar_process = subprocess.Popen([executable_path], stdin=cat_process.stdout, stdout=subprocess.PIPE,
                                          stderr=subprocess.PIPE, text=True)
         cat_process.stdout.close()
-        stdout, stderr = astar_process.communicate(timeout=60)
+        stdout, stderr = astar_process.communicate(timeout=configured_timeout)
         end_time = time.perf_counter()
         execution_time = (end_time - start_time) * 1000
 
@@ -212,7 +259,7 @@ def run_single_problem(executable_path, problem_path):
             return None, f"JSON解析エラー: {e}\n出力: {stdout}"
 
     except subprocess.TimeoutExpired:
-        error_msg = "タイムアウト (60秒)"
+        error_msg = f"タイムアウト ({configured_timeout}秒)"
         if astar_process: kill_process_tree(astar_process)
         if cat_process: kill_process_tree(cat_process)
         return None, error_msg
@@ -292,6 +339,11 @@ def run_benchmark_with_config(executable_path, problems_dir, problems_per_size, 
 
         df.to_csv(results_csv_path, index=False)
         if summary:
+            # 設定されたタイムアウト値を取得してサマリーに追加
+            config_path = get_timeout_config_path(executable_path)
+            configured_timeout = load_timeout_from_config(config_path)
+            summary['timeout_seconds'] = configured_timeout # Use a more descriptive key like 'timeout_seconds'
+
             with open(results_json_path, 'w', encoding='utf-8') as f:
                 json.dump(summary, f, indent=2, ensure_ascii=False, default=to_serializable)
 
@@ -522,13 +574,238 @@ def individual_analysis_page(csv_files):
         if min_size > max_size: st.error("最小サイズが最大サイズを超えています。")
 
         problems_per_size = st.number_input("各サイズで実行する問題数", min_value=1, value=5, step=1)
+        timeout_seconds = st.number_input("タイムアウト秒数 (10-300秒)", min_value=10, max_value=300, value=60, step=1, key="timeout_seconds_input")
 
         if st.button("🚀 ベンチマーク実行", type="primary", disabled=(min_size > max_size)):
-            run_benchmark_with_config(executable_path, problems_dir, problems_per_size, min_size, max_size)
+            # タイムアウト設定を保存
+            current_executable_path = executable_path # st.text_inputの現在の値を取得
+            config_path = get_timeout_config_path(current_executable_path)
+            save_timeout_to_config(config_path, timeout_seconds)
 
+            # ベンチマーク実行
+            run_benchmark_with_config(current_executable_path, problems_dir, problems_per_size, min_size, max_size)
+
+
+# --- Helper Functions for Comparison Page ---
+
+def load_and_merge_benchmark_data(
+    selected_options: list[str],
+    file_map: dict[str, str]
+) -> tuple[pd.DataFrame | None, list[str], dict[str, dict]]:
+    """Loads and merges data for selected benchmarks."""
+    all_dfs = []
+    all_df_names = []
+    all_summaries = {}
+
+    for option_stem in selected_options:
+        filepath = file_map[option_stem]
+        df, summary = load_benchmark_results(filepath) # Assuming load_benchmark_results is defined elsewhere
+        if df is not None and not df.empty:
+            # Ensure 'problem_id' is string for consistent merging
+            if 'problem_id' in df.columns:
+                df['problem_id'] = df['problem_id'].astype(str)
+            if 'size' in df.columns: # Ensure size is int
+                 df['size'] = df['size'].astype(int)
+
+            all_dfs.append(df)
+            all_df_names.append(option_stem)
+            if summary is not None:
+                all_summaries[option_stem] = summary
+        else:
+            st.warning(f"結果 '{option_stem}' のデータの読み込みに失敗したか、空です。スキップします。")
+
+    if len(all_dfs) < 1: # Need at least one to start merging/displaying
+        st.warning("有効なデータセットが1つも見つかりませんでした。")
+        return None, [], {}
+
+    if not all_dfs: # Should be caught by len(all_dfs) < 1 already
+        return None, [], {}
+
+    # Merge DataFrames
+    merged_df = all_dfs[0].copy()
+    # Ensure 'solved' column is boolean and handle potential non-boolean types before suffixing.
+    # Also, make sure essential merge keys 'size', 'problem_id' are present.
+    if not all({'size', 'problem_id'}.issubset(merged_df.columns)):
+        st.error(f"最初のデータフレーム '{all_df_names[0]}' に 'size' または 'problem_id' がありません。マージを中止します。")
+        return None, [], {}
+
+    if f"solved" in merged_df.columns: # Original column name before suffix
+        merged_df[f"solved"] = merged_df[f"solved"].astype('boolean')
+    merged_df = merged_df.add_suffix(f"_{all_df_names[0]}")
+    # Rename merge keys to not have suffix from the first df
+    merged_df.rename(columns={
+        f"size_{all_df_names[0]}": "size",
+        f"problem_id_{all_df_names[0]}": "problem_id"
+    }, inplace=True)
+
+
+    for i in range(1, len(all_dfs)):
+        current_df_name = all_df_names[i]
+        current_df_to_merge = all_dfs[i].copy()
+
+        if not all({'size', 'problem_id'}.issubset(current_df_to_merge.columns)):
+            st.warning(f"データフレーム '{current_df_name}' に 'size' または 'problem_id' がありません。このデータセットをスキップします。")
+            continue
+
+        if f"solved" in current_df_to_merge.columns:
+            current_df_to_merge[f"solved"] = current_df_to_merge[f"solved"].astype('boolean')
+        current_df_to_merge = current_df_to_merge.add_suffix(f"_{current_df_name}")
+        current_df_to_merge.rename(columns={
+            f"size_{current_df_name}": "size",
+            f"problem_id_{current_df_name}": "problem_id"
+        }, inplace=True)
+
+        merged_df = pd.merge(merged_df, current_df_to_merge, on=['size', 'problem_id'], how='outer')
+
+    return merged_df, all_df_names, all_summaries
+
+
+def calculate_benchmark_improvement_rates(
+    merged_df: pd.DataFrame,
+    baseline_name: str,
+    all_df_names: list[str],
+    metrics_to_compare: list[str]
+) -> pd.DataFrame:
+    """Calculates improvement rates for specified metrics against a baseline."""
+    if not baseline_name or merged_df.empty:
+        return merged_df
+
+    # Make a copy to avoid SettingWithCopyWarning
+    # merged_df_processed = merged_df.copy() # Already a copy if coming from load_and_merge
+    # No, merged_df from load_and_merge is the actual merged_df, so copy is good.
+    merged_df_processed = merged_df.copy()
+
+
+    for df_name in all_df_names:
+        if df_name == baseline_name:
+            continue
+
+        for metric in metrics_to_compare:
+            baseline_col = f"{metric}_{baseline_name}"
+            current_col = f"{metric}_{df_name}"
+            rate_col_name = f"{metric}_improvement_rate_vs_{baseline_name}_for_{df_name}"
+
+            if baseline_col in merged_df_processed.columns and current_col in merged_df_processed.columns:
+                baseline_values = merged_df_processed[baseline_col].astype(float)
+                current_values = merged_df_processed[current_col].astype(float)
+
+                improvement_rate = (baseline_values - current_values) / baseline_values * 100
+
+                improvement_rate[ (baseline_values == 0) & (current_values == 0) ] = 0
+                improvement_rate[ (baseline_values == 0) & (current_values > 0) ] = -np.inf
+
+                improvement_rate.replace([np.inf, -np.inf], np.nan, inplace=True)
+                merged_df_processed[rate_col_name] = improvement_rate # Keep NaNs for now
+            else:
+                st.warning(f"レート計算に必要なカラムが見つかりません: {baseline_col} または {current_col}")
+
+    return merged_df_processed
+
+
+def create_comparison_summary_table_df(
+    all_summaries: dict[str, dict],
+    merged_df: pd.DataFrame,
+    all_df_names: list[str],
+    baseline_name: str | None,
+    basic_metric_keys: dict[str, str], # e.g. {'total_problems': 'Total Problems'}
+    rate_metric_specs: dict[str, str] # e.g. {'calculation_time_ms': 'Avg Calc Time Improvement %'}
+) -> pd.DataFrame:
+    """Creates the summary table DataFrame for comparison."""
+
+    table_rows = []
+
+    # Basic summary metrics
+    for internal_key, display_name in basic_metric_keys.items():
+        row_data = {'Metric': display_name}
+        for df_name in all_df_names:
+            summary = all_summaries.get(df_name, {})
+            val = summary.get(internal_key)
+            if pd.isna(val):
+                row_data[df_name] = "N/A"
+            elif isinstance(val, float):
+                if 'time' in internal_key or 'ms' in internal_key : # crude check for time
+                     row_data[df_name] = f"{val:.2f}"
+                elif 'nodes' in internal_key :
+                     row_data[df_name] = f"{val:,.0f}"
+                elif 'moves' in internal_key:
+                     row_data[df_name] = f"{val:.1f}"
+                else:
+                     row_data[df_name] = f"{val:.2f}" # Default float formatting
+            else: # int or string
+                row_data[df_name] = val
+        table_rows.append(row_data)
+
+    # Improvement rate metrics
+    if baseline_name and not merged_df.empty:
+        for internal_metric, display_name in rate_metric_specs.items():
+            row_data = {'Metric': display_name}
+            for df_name in all_df_names:
+                if df_name == baseline_name:
+                    row_data[df_name] = "Baseline"
+                else:
+                    rate_col = f"{internal_metric}_improvement_rate_vs_{baseline_name}_for_{df_name}"
+                    if rate_col in merged_df.columns:
+                        avg_rate = merged_df[rate_col].mean()
+                        row_data[df_name] = f"{avg_rate:.1f}%" if pd.notna(avg_rate) else "N/A"
+                    else:
+                        row_data[df_name] = "N/A (no data)"
+            table_rows.append(row_data)
+
+    if not table_rows: # If no data at all
+        return pd.DataFrame(columns=['Metric'] + all_df_names).set_index('Metric')
+
+    summary_df = pd.DataFrame(table_rows)
+    summary_df.set_index('Metric', inplace=True)
+    return summary_df
+
+
+def generate_comparison_line_charts_figures(
+    merged_df: pd.DataFrame,
+    all_df_names: list[str],
+    chart_specs: list[dict] # Each dict: {'metric_key': 'col_name_part', 'title': 'Chart Title', 'yaxis_title': 'Y Axis'}
+) -> list[go.Figure]:
+    """Generates line charts for comparing benchmark performance metrics."""
+    figures = []
+    if merged_df.empty:
+        return figures
+
+    for spec in chart_specs:
+        fig = go.Figure()
+        st.subheader(spec['title']) # Display title before the chart
+
+        for df_name in all_df_names:
+            solved_col = f"solved_{df_name}"
+            metric_col = f"{spec['metric_key']}_{df_name}"
+
+            if solved_col in merged_df.columns and metric_col in merged_df.columns:
+                # Ensure boolean type for solved_col before filtering
+                # This might be redundant if already cast during merge, but safe.
+                try: # Add try-except for astype if column is all NaN from an outer join
+                    merged_df[solved_col] = merged_df[solved_col].astype('boolean')
+                    solved_data_for_benchmark = merged_df[merged_df[solved_col].fillna(False)] # Treat NaN as False for solved
+                except TypeError: # Handle cases where astype('boolean') fails e.g. mixed types not convertible
+                     st.caption(f"注意: '{df_name}' の解決状態カラム ({solved_col}) の型変換に問題があり、グラフ生成をスキップする可能性があります。")
+                     continue
+
+
+                if not solved_data_for_benchmark.empty:
+                    agg_data = solved_data_for_benchmark.groupby('size')[metric_col].mean().reset_index()
+                    fig.add_trace(go.Scatter(x=agg_data['size'], y=agg_data[metric_col], mode='lines+markers', name=df_name))
+                else:
+                    st.caption(f"注意: '{df_name}' には '{spec['title']}' の解決済み問題データがありません。")
+            else:
+                st.caption(f"注意: '{df_name}' の '{spec['title']}' または解決状態カラム ({metric_col} or {solved_col}) がマージ後データに存在しません。")
+
+        fig.update_layout(xaxis_title="パズルサイズ", yaxis_title=spec['yaxis_title'], legend_title_text='ベンチマーク')
+        figures.append(fig)
+
+    return figures
+
+
+# --- Main Application Pages ---
 
 def comparison_page(csv_files):
-    """【新規】比較分析ページのUIとロジック"""
+    """比較分析ページのUIとロジック"""
     st.title("📊 パフォーマンス比較")
 
     if len(csv_files) < 2:
@@ -537,56 +814,84 @@ def comparison_page(csv_files):
         return
 
     file_options = {Path(f).stem: f for f in csv_files}
+    selected_benchmark_options = st.multiselect(
+        "比較するベンチマーク結果を選択 (2つ以上)",
+        options=list(file_options.keys()),
+        key="benchmark_multiselect"
+    )
 
-    col1, col2 = st.columns(2)
-    with col1:
-        selection_a = st.selectbox("比較対象 A", options=list(file_options.keys()), index=0, key="comp_a")
-    with col2:
-        selection_b = st.selectbox("比較対象 B", options=list(file_options.keys()), index=1, key="comp_b")
-
-    if selection_a == selection_b:
-        st.error("同じデータは比較できません。異なるデータを選択してください。")
+    if len(selected_benchmark_options) < 2:
+        st.warning("比較するには少なくとも2つのベンチマーク結果を選択してください。")
         return
 
-    # データの読み込みと準備
-    df_a, summary_a = load_benchmark_results(file_options[selection_a])
-    df_b, summary_b = load_benchmark_results(file_options[selection_b])
+    # 1. Load and Merge Data
+    merged_df, all_df_names, all_summaries = load_and_merge_benchmark_data(
+        selected_benchmark_options, file_options
+    )
 
-    # --- 概要比較 ---
+    if merged_df is None or merged_df.empty:
+        st.error("データの読み込みまたはマージに失敗しました。処理を続行できません。")
+        return
+    if len(all_df_names) < 2: # Check again after loading in case some failed
+        st.warning("比較を実行するには、少なくとも2つの有効なデータセットを読み込む必要があります。")
+        return
+
+
+    # 2. Baseline Selection and Rate Calculation
     st.markdown("---")
-    col1, col2 = st.columns(2)
-    with col1:
-        display_metrics_overview(summary_a, header=f"概要: {selection_a}")
-    with col2:
-        display_metrics_overview(summary_b, header=f"概要: {selection_b}")
+    baseline_name = st.selectbox(
+        "ベースラインにするベンチマークを選択",
+        options=all_df_names, # Use names of successfully loaded DFs
+        index=0,
+        key="baseline_selection"
+    )
 
-    # --- グラフ比較 ---
+    metrics_for_rate_calculation = ['calculation_time_ms', 'nodes_explored']
+    if baseline_name:
+        merged_df = calculate_benchmark_improvement_rates(
+            merged_df, baseline_name, all_df_names, metrics_for_rate_calculation
+        )
+
+    # 3. Display Summary Table
+    st.markdown("---")
+    st.subheader("📊 総合サマリー比較")
+    basic_summary_metrics = {
+        'total_problems': 'Total Problems',
+        'solved_problems': 'Solved Problems',
+        'avg_calculation_time_ms': 'Avg Calculation Time (ms)',
+        'avg_nodes_explored': 'Avg Nodes Explored',
+        'avg_moves': 'Avg Moves'
+    }
+    rate_metrics_for_summary = {
+        'calculation_time_ms': 'Avg Calc Time Improvement %',
+        'nodes_explored': 'Avg Nodes Explored Impr. %'
+    }
+    summary_table_df = create_comparison_summary_table_df(
+        all_summaries, merged_df, all_df_names, baseline_name,
+        basic_summary_metrics, rate_metrics_for_summary
+    )
+    st.dataframe(summary_table_df, use_container_width=True)
+
+    # 4. Display Charts
     st.markdown("---")
     st.header("📈 グラフでの性能比較")
 
-    # 時間性能
-    st.subheader("⏱️ サイズ別平均計算時間")
-    time_a = df_a[df_a['solved'] == True].groupby('size')['calculation_time_ms'].mean().reset_index()
-    time_b = df_b[df_b['solved'] == True].groupby('size')['calculation_time_ms'].mean().reset_index()
-    fig_time = go.Figure()
-    fig_time.add_trace(
-        go.Scatter(x=time_a['size'], y=time_a['calculation_time_ms'], mode='lines+markers', name=selection_a))
-    fig_time.add_trace(
-        go.Scatter(x=time_b['size'], y=time_b['calculation_time_ms'], mode='lines+markers', name=selection_b))
-    fig_time.update_layout(xaxis_title="パズルサイズ", yaxis_title="平均計算時間 (ms)")
-    st.plotly_chart(fig_time, use_container_width=True)
+    chart_specs = [
+        {'metric_key': 'calculation_time_ms', 'title': '⏱️ サイズ別平均計算時間', 'yaxis_title': '平均計算時間 (ms)'},
+        {'metric_key': 'nodes_explored', 'title': '🔍 サイズ別平均探索ノード数', 'yaxis_title': '平均探索ノード数'}
+    ]
 
-    # 探索性能
-    st.subheader("🔍 サイズ別平均探索ノード数")
-    nodes_a = df_a[df_a['solved'] == True].groupby('size')['nodes_explored'].mean().reset_index()
-    nodes_b = df_b[df_b['solved'] == True].groupby('size')['nodes_explored'].mean().reset_index()
-    fig_nodes = go.Figure()
-    fig_nodes.add_trace(
-        go.Scatter(x=nodes_a['size'], y=nodes_a['nodes_explored'], mode='lines+markers', name=selection_a))
-    fig_nodes.add_trace(
-        go.Scatter(x=nodes_b['size'], y=nodes_b['nodes_explored'], mode='lines+markers', name=selection_b))
-    fig_nodes.update_layout(xaxis_title="パズルサイズ", yaxis_title="平均探索ノード数")
-    st.plotly_chart(fig_nodes, use_container_width=True)
+    if not merged_df.empty:
+        chart_figures = generate_comparison_line_charts_figures(merged_df, all_df_names, chart_specs)
+        for fig in chart_figures:
+            st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.warning("マージされたデータが空のため、グラフを表示できません。")
+
+    # Debug view
+    if st.checkbox("マージされたDataFrameを表示 (デバッグ用)"):
+        st.dataframe(merged_df)
+        st.write(f"カラム名: {merged_df.columns.tolist()}")
 
 
 def main():
